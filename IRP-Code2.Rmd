@@ -1,0 +1,284 @@
+---
+title: "IRP-Code2"
+author: "Cooper Ristau"
+date: "10/31/2021"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = F}
+library(readxl)
+library(knitr)
+library(zoo)
+library(stringr)
+library(rvest)
+library(h2o)
+library(lubridate)
+library(dplyr)
+library(tidyverse)
+library(rmarkdown)
+```
+
+### Note: Essentially all of this code is referencing Pipis work (and following it closely), so it is necessary to include it all. None of the data frames shown below are included in the report because they look ugly and including them would have been asking for a formatting nightmare. However, they obviously must be included to show how the data was analyzed. 
+
+
+```{r}
+#reading in data (I compiled all data into a csv to make things easier)
+by_team <- read_excel("C://Users/rista/Downloads/all_nba_data_2020.xlsx")
+#we want all but postponed games so we filter accordingly
+by_team <- by_team %>%
+  filter(RESULT !='POSTPONED')
+names(by_team) <- c("DATE", "OPPONENT", "RESULT", "W-L", "Hi Points", "Hi Rebounds", "Hi Assists", "URLTeam", "FullURLTeam")
+```
+
+# Step 1: Adding Total Win Rates
+
+```{r, message = 'hide', warning = 'hide'}
+#we must add our win rates via the following code
+by_team_mod <- by_team %>%
+  #here we select all variables but hi points, rebounds, and assists (not needed for this part)
+  select(-(`Hi Points`:`Hi Assists`)) %>%
+  #changing opponent variable from @Opponent to simply the opponent
+  mutate(CleanOpponent = str_replace(str_extract(str_replace(OPPONENT, "^vs",""), "[A-Za-z].+"), " \\*",""), 
+         #specifying whether the team was home or away by creating a new variable for it
+    HomeAway = ifelse(substr(OPPONENT,1,2)=="vs", "Home", "Away"), WL=`W-L`) %>%
+  separate(WL, c("W", "L"), sep="-") %>% 
+  #this is the important part
+  #here, we create Tpct, which is the win rate up to the given game
+  #TLast10 is the same concept just for the last 10 games only
+  mutate(Tpct=as.numeric(W) / (as.numeric(L)+as.numeric(W))) %>%
+  mutate(dummy=1, Outcome=ifelse(substr(RESULT,1,1)=="W",1,0)) %>%
+  group_by(URLTeam) %>%
+  mutate(Rank = row_number(), TeamMatchID=paste0(Rank,URLTeam,HomeAway), 
+         TLast10 = rollapplyr(Outcome, 10, sum, partial = TRUE)/ rollapplyr(dummy, 10, sum, partial = TRUE)) %>%
+  group_by(URLTeam, HomeAway) %>%
+  #Rpct and RLast10 are the win rates up to the given game while
+  #now considering home games and away games
+  mutate(Rpct=cumsum(Outcome)/cumsum(dummy), 
+         RLast10=rollapplyr(Outcome, 10, sum, partial = TRUE)/ rollapplyr(dummy, 10, sum, partial = TRUE)) %>%
+  mutate_at(vars(Rpct, RLast10), funs(lag)) %>%
+  group_by(URLTeam) %>%
+  mutate_at(vars(Tpct, TLast10), funs(lag)) %>%
+  na.omit() %>%
+  #selecting only relevant variables for a new data frame
+  select(TeamMatchID, Rank, DATE, URLTeam, FullURLTeam, CleanOpponent, HomeAway,Tpct,TLast10 , 
+         Rpct, RLast10, Outcome)
+#showing Tpct, TLast10, Rpct, and RLast10 (only first 5 rows shown to save space) 
+show1 <- dplyr::select(head(by_team_mod, 5), DATE, URLTeam, CleanOpponent, Tpct, TLast10, Rpct, RLast10, HomeAway, Outcome)
+names(show1) <- c("Date", "Team Abv", "Opponent", "Tpct", "TLast10", "Rpct", "RLast10", "HomeAway", "Outcome")
+show1
+#Team Abv is the same as the Team variable but abbreviated
+```
+
+# Step 2: Adding Win Rates for Home & Away Games
+
+```{r}
+#Setting blank df to fill in the for loop 
+df <- data.frame(matrix(ncol = 16, nrow = 0))
+#this is the important piece, HRpct is the percentage of all home games won, while HRLast10 
+#is the percentage of the last 10 home games won (and similarly done with away games with ARpct and 
+#ARLast10)
+x <- c(colnames(by_team_mod), "HRpct", "HRLast10",  "ARpct", "ARLast10")
+colnames(df) <- x
+
+
+for (i in 1:nrow(by_team_mod)) {
+  if(by_team_mod[i,"HomeAway"]=="Home") {
+    df[i,c(1:14)]<-data.frame(by_team_mod[i,c(1:12)], by_team_mod[i,c(10:11)])
+  }
+  else {
+    
+    df[i,c(1:12)]<-by_team_mod[i,c(1:12)]
+    df[i,c(15:16)]<-by_team_mod[i,c(10:11)]
+    
+  }
+}
+
+df<-df %>%
+  group_by(URLTeam) %>%
+  fill(HRpct , HRLast10, ARpct,  ARLast10, .direction=c("down")) %>% 
+  ungroup() %>%
+  na.omit() %>%
+  filter(Rank>=10)
+show2 <- select(head(df, 5), DATE, URLTeam, CleanOpponent, HRpct, HRLast10, ARpct, ARLast10, HomeAway, Outcome)
+names(show2) <- c("Date", "Team Abv", "Opponent", "HRpct", "HRLast10", "ARpct", "ARLast10", "HomeAway", "Outcome")
+show2
+```
+
+# Step 3: Combining All Win Rates
+
+```{r}
+#home team data frame
+H_df <- df %>% 
+  filter(HomeAway=="Home") %>%
+  ungroup()
+colnames(H_df)<-paste0("H_", names(H_df))
+
+#away team data frame
+A_df <- df %>%
+  filter(HomeAway!="Home") %>%
+  ungroup()
+colnames(A_df)<-paste0("A_", names(A_df))
+
+#combining the home and away data frames into one that will be used for building the 
+#random forest algorithm
+Full_df <- H_df %>%
+  inner_join(A_df, by=c("H_CleanOpponent"="A_FullURLTeam", "H_DATE"="A_DATE")) %>%
+  select(H_DATE, H_URLTeam, A_URLTeam, H_Tpct, H_TLast10, H_HRpct, H_HRLast10, H_ARpct, H_ARLast10, 
+         A_Tpct, A_TLast10, A_HRpct, A_HRLast10, A_ARpct, A_ARLast10,  H_Outcome)
+show3 <- head(Full_df, 5)
+names(show3) <- c("H_DATE", "H_TeamAbv", "A_TeamAbv", "H_Tpct", "H_TLast10", "H_HRpct", "H_HRLast10", "H_ARpct",
+                 "H_ARLast10", "A_Tpct", "A_TLast10", "A_HRpct", "A_HRLast10", "A_ARpct", "A_ARLast10", "H_Outcome")
+show3
+```
+
+# Step 4: Building the Random Forest Model
+
+### Picking an Ideal Random Forest Model & Estimating the OOB MSE
+
+```{r}
+#estimating OOB MSE with number of trees = 50
+set.seed(4893)
+
+h2o.init()
+Train_h2o<-as.h2o(Full_df)
+Train_h2o$H_Outcome<-as.factor(Train_h2o$H_Outcome)
+
+model2 <- h2o.randomForest(y = 16, x=c(4:15), training_frame = Train_h2o, max_depth = 4, ntrees = 50)
+h2o.performance(model2)
+#estimating OOB MSE with number of trees = 100
+model3 <- h2o.randomForest(y = 16, x=c(4:15), training_frame = Train_h2o, max_depth = 4, ntrees = 100)
+h2o.performance(model3)
+#estimating OOB MSE with number of trees = 500
+model1 <- h2o.randomForest(y = 16, x=c(4:15), training_frame = Train_h2o, mtries = 4, max_depth = 4, ntrees = 500)
+h2o.performance(model1)
+```
+
+### Model Fit
+
+```{r, results = 'hide'}
+set.seed(4893)
+
+h2o.init()
+Train_h2o<-as.h2o(Full_df)
+Train_h2o$H_Outcome<-as.factor(Train_h2o$H_Outcome)
+
+head(Full_df)
+
+model1 <- h2o.randomForest(y = 16, x=c(4:15), training_frame = Train_h2o, mtries = 4, max_depth = 4, ntrees = 500)
+```
+
+# Step 5: Predictions using Final Data Frame
+
+```{r}
+set.seed(4893)
+#we only need win rates for the each team on the last day of the season
+#so we create a dataframe that only includes those
+df <- data.frame(matrix(ncol = 16, nrow = 0))
+x <- c(colnames(by_team_mod), "HRpct", "HRLast10",  "ARpct", "ARLast10")
+colnames(df) <- x
+
+for (i in 1:nrow(by_team_mod)) {
+  if(by_team_mod[i,"HomeAway"]=="Home") {
+    df[i,c(1:14)]<-data.frame(by_team_mod[i,c(1:12)], by_team_mod[i,c(10:11)])
+  }
+  else {
+    df[i,c(1:12)]<-by_team_mod[i,c(1:12)]
+    df[i,c(15:16)]<-by_team_mod[i,c(10:11)]
+    
+  }
+}
+m_df <- df %>%
+  group_by(URLTeam) %>%
+  fill(HRpct , HRLast10, ARpct,  ARLast10, .direction=c("down")) %>%
+  ungroup() %>%
+  na.omit() %>%
+  group_by(URLTeam) %>%
+  slice(n()) %>%
+  ungroup()
+```
+
+### Example 1: Houston vs. Utah
+
+```{r}
+set.seed(4893)
+df<-{}
+a<-c("hou")
+h<-c("utah")
+
+for (i in 1:length(a)) {
+  th <- m_df %>%
+    filter(URLTeam==h[i]) %>%
+    select(Tpct:ARLast10, -Outcome)
+  colnames(th) <- paste0("H_", colnames(th))
+  
+  ta <- m_df %>%
+    filter(URLTeam==a[i]) %>% 
+    select(Tpct:ARLast10, -Outcome)
+  colnames(ta)<-paste0("A_", colnames(ta))
+  
+  pred_data<-cbind(th,ta)
+  
+  tmp<-data.frame(Away=a[i], Home=h[i], as.data.frame(predict(model1,as.h2o(pred_data))))
+  df<-rbind(df, tmp)
+}
+df <- df %>%
+  select(-predict)
+prediction_df <- data.frame(
+  Team = c()
+)
+df
+```
+
+### Eample 2: Phoenix vs. San Antonio
+
+```{r}
+df<-{}
+a<-c("phx")
+h<-c("sa")
+
+for (i in 1:length(a)) {
+  th <- m_df %>%
+    filter(URLTeam==h[i]) %>%
+    select(Tpct:ARLast10, -Outcome)
+  colnames(th) <- paste0("H_", colnames(th))
+  
+  ta <- m_df %>%
+    filter(URLTeam==a[i]) %>% 
+    select(Tpct:ARLast10, -Outcome)
+  colnames(ta)<-paste0("A_", colnames(ta))
+  
+  pred_data<-cbind(th,ta)
+  
+  tmp<-data.frame(Away=a[i], Home=h[i], as.data.frame(predict(model1,as.h2o(pred_data))))
+  df<-rbind(df, tmp)
+}
+df <- df %>%
+  select(-predict)
+prediction_df <- data.frame(
+  Team = c()
+)
+df
+```
+
+# Data Frame used for Exploratory Analysis 
+
+All visuals are done in Excel, but all the visuals (aside from the pie charts) use data from the data frame below. This data frame simply calculates the number of games won for all 30 NBA teams. 
+
+```{r}
+explore_df <- by_team %>%
+  mutate(Win = ifelse(substr(RESULT,1,1)=="W",1,0))
+wins_per_team <- explore_df %>%
+  filter(Win == 1) %>%
+  group_by(FullURLTeam) %>%
+  count(Win)
+names(wins_per_team) <- c("Team", "Win Value", "# of Wins")
+wins_per_team <- wins_per_team[,c(1,3)]
+wins_per_team
+```
+
